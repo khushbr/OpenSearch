@@ -969,7 +969,8 @@ public class NodeStatsTests extends OpenSearchTestCase {
             indicesStats = new NodeIndicesStats(
                 new CommonStats(CommonStatsFlags.ALL),
                 new HashMap<>(),
-                new SearchRequestStats(clusterSettings)
+                new SearchRequestStats(clusterSettings),
+                false
             );
             RemoteSegmentStats remoteSegmentStats = indicesStats.getSegments().getRemoteSegmentStats();
             remoteSegmentStats.addUploadBytesStarted(10L);

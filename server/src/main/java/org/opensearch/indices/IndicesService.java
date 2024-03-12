@@ -364,6 +364,7 @@ public class IndicesService extends AbstractLifecycleComponent
     private volatile TimeValue clusterRemoteTranslogBufferInterval;
 
     private final SearchRequestStats searchRequestStats;
+    private AtomicInteger inFlightIndexRemoval;
 
     @Override
     protected void doStart() {
@@ -500,6 +501,7 @@ public class IndicesService extends AbstractLifecycleComponent
         clusterService.getClusterSettings()
             .addSettingsUpdateConsumer(CLUSTER_REMOTE_TRANSLOG_BUFFER_INTERVAL_SETTING, this::setClusterRemoteTranslogBufferInterval);
         this.recoverySettings = recoverySettings;
+        this.inFlightIndexRemoval = new AtomicInteger();
     }
 
     /**
@@ -589,7 +591,9 @@ public class IndicesService extends AbstractLifecycleComponent
     }
 
     public NodeIndicesStats stats(CommonStatsFlags flags) {
+        boolean partialResult = false;
         CommonStats commonStats = new CommonStats(flags);
+        logger.info("MOCHI indexing stats: {}, now Adding oldShardsStats", commonStats.indexing);
         // the cumulative statistics also account for shards that are no longer on this node, which is tracked by oldShardsStats
         for (Flag flag : flags.getFlags()) {
             switch (flag) {
@@ -616,8 +620,25 @@ public class IndicesService extends AbstractLifecycleComponent
                     break;
             }
         }
+        final int inFlightAndCompletedShardRemovals = getInFlightAndCompletedShardRemovals(this);
+        logger.info("MOCHI indices: {}, inFlightAndCompletedShardRemovals: {}", indices.values(), inFlightAndCompletedShardRemovals);
+        if (inFlightAndCompletedShardRemovals > oldShardsStats.removedShardCount || inFlightIndexRemoval.get() > 0 ) {
+            // partial_result, old stats has not been updated yet.
+            partialResult = true;
+        }
+        logger.info("MOCHI, post oldShardsStats add -  indexing stats: {}", commonStats.indexing);
+        Map<Index, List<IndexShardStats>> stats_mochi = statsByShard(this, flags);
+        logger.info("MOCHI, statsByShard: {}", stats_mochi);
+        return new NodeIndicesStats(commonStats, stats_mochi, searchRequestStats, partialResult);
+    }
 
-        return new NodeIndicesStats(commonStats, statsByShard(this, flags), searchRequestStats);
+    int getInFlightAndCompletedShardRemovals(final IndicesService indicesService) {
+        return indicesService
+            .indices
+            .values()
+            .stream()
+            .mapToInt(IndexService::getShardRemovals)
+            .sum();
     }
 
     Map<Index, List<IndexShardStats>> statsByShard(final IndicesService indicesService, final CommonStatsFlags flags) {
@@ -1052,12 +1073,14 @@ public class IndicesService extends AbstractLifecycleComponent
                 indexService = newIndices.remove(index.getUUID());
                 assert indexService != null : "IndexService is null for index: " + index;
                 indices = unmodifiableMap(newIndices);
+                inFlightIndexRemoval.getAndIncrement();
                 listener = indexService.getIndexEventListener();
             }
 
             listener.beforeIndexRemoved(indexService, reason);
             logger.debug("{} closing index service (reason [{}][{}])", index, reason, extraInfo);
             indexService.close(extraInfo, reason == IndexRemovalReason.DELETED);
+            inFlightIndexRemoval.getAndDecrement();
             logger.debug("{} closed... (reason [{}][{}])", index, reason, extraInfo);
             final IndexSettings indexSettings = indexService.getIndexSettings();
             listener.afterIndexRemoved(indexService.index(), indexSettings, reason);
@@ -1105,10 +1128,13 @@ public class IndicesService extends AbstractLifecycleComponent
         final RefreshStats refreshStats = new RefreshStats();
         final FlushStats flushStats = new FlushStats();
         final RecoveryStats recoveryStats = new RecoveryStats();
+        volatile int removedShardCount = 0;
 
         @Override
         public synchronized void beforeIndexShardClosed(ShardId shardId, @Nullable IndexShard indexShard, Settings indexSettings) {
             if (indexShard != null) {
+                logger.info("MOCHI beforeIndexShardClosed [PRE] indexShard: {} and the value({})", indexShard, indexingStats.toString());
+                removedShardCount++;
                 getStats.addTotals(indexShard.getStats());
                 indexingStats.addTotals(indexShard.indexingStats());
                 // if this index was closed or deleted, we should eliminate the effect of the current scroll for this shard
@@ -1117,6 +1143,7 @@ public class IndicesService extends AbstractLifecycleComponent
                 refreshStats.addTotals(indexShard.refreshStats());
                 flushStats.addTotals(indexShard.flushStats());
                 recoveryStats.addTotals(indexShard.recoveryStats());
+                logger.info("MOCHI beforeIndexShardClosed [POST] indexShard: {} and the value({})", indexShard, indexingStats.toString());
             }
         }
     }

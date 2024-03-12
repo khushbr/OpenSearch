@@ -42,6 +42,7 @@ import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.metadata.IndexGraveyard;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.Metadata;
+import org.opensearch.cluster.routing.RoutingTable;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.UUIDs;
 import org.opensearch.common.settings.Setting;
@@ -92,6 +93,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
+import static org.mockito.Mockito.*;
 import static org.opensearch.action.support.WriteRequest.RefreshPolicy.IMMEDIATE;
 import static org.opensearch.test.hamcrest.OpenSearchAssertions.assertAcked;
 import static org.opensearch.test.hamcrest.OpenSearchAssertions.assertHitCount;
@@ -100,8 +102,6 @@ import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.hasToString;
 import static org.hamcrest.Matchers.instanceOf;
 import static org.hamcrest.Matchers.not;
-import static org.mockito.Mockito.mock;
-import static org.mockito.Mockito.when;
 
 public class IndicesServiceTests extends OpenSearchSingleNodeTestCase {
 
@@ -559,6 +559,19 @@ public class IndicesServiceTests extends OpenSearchSingleNodeTestCase {
         assertThat(indexStats.isEmpty(), equalTo(false));
         assertThat("index not defined", indexStats.containsKey(index), equalTo(true));
         assertThat("unexpected shard stats", indexStats.get(index), equalTo(shardStats));
+    }
+
+    public void testPartialResultStatusInStats() {
+        final IndicesService indicesService = getIndicesService();
+        final IndicesService spyIndicesService = spy(indicesService);
+
+        when(spyIndicesService.getInFlightAndCompletedShardRemovals(spyIndicesService)).thenReturn(0);
+        final NodeIndicesStats stats1 = indicesService.stats(CommonStatsFlags.NONE);
+        assertThat(stats1.getPartialResultStatus(), equalTo(false));
+
+        when(spyIndicesService.getInFlightAndCompletedShardRemovals(spyIndicesService)).thenReturn(1);
+        final NodeIndicesStats stats2 = spyIndicesService.stats(CommonStatsFlags.NONE);
+        assertThat(stats2.getPartialResultStatus(), equalTo(true));
     }
 
     public void testIsMetadataField() {

@@ -2753,6 +2753,11 @@ public final class InternalTestCluster extends TestCluster {
                     stats.getIndices().getSegments().getBitsetMemoryInBytes(),
                     equalTo(0L)
                 );
+                assertThat(
+                    "Partial Result should be zero with no shard removal on node " + stats.getNode(),
+                    stats.getIndices().getPartialResultStatus(),
+                    equalTo(false)
+                );
             }
         }
     }

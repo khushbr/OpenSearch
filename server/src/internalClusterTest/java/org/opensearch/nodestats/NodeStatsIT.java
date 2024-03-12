@@ -23,6 +23,7 @@ import org.opensearch.index.IndexNotFoundException;
 import org.opensearch.index.engine.DocumentMissingException;
 import org.opensearch.index.engine.VersionConflictEngineException;
 import org.opensearch.index.shard.IndexingStats.Stats.DocStatusStats;
+import org.opensearch.indices.NodeIndicesStats;
 import org.opensearch.test.OpenSearchIntegTestCase;
 import org.opensearch.test.OpenSearchIntegTestCase.ClusterScope;
 import org.opensearch.test.OpenSearchIntegTestCase.Scope;
@@ -244,18 +245,19 @@ public class NodeStatsIT extends OpenSearchIntegTestCase {
     }
 
     private void assertDocStatusStats() {
-        DocStatusStats docStatusStats = client().admin()
+        NodeIndicesStats nodeIndicesStats = client().admin()
             .cluster()
             .prepareNodesStats()
             .execute()
             .actionGet()
             .getNodes()
             .get(0)
-            .getIndices()
+            .getIndices();
+
+        DocStatusStats docStatusStats = nodeIndicesStats
             .getIndexing()
             .getTotal()
             .getDocStatusStats();
-
         assertTrue(
             Arrays.equals(
                 docStatusStats.getDocStatusCounter(),
@@ -263,6 +265,8 @@ public class NodeStatsIT extends OpenSearchIntegTestCase {
                 Comparator.comparingLong(AtomicLong::longValue)
             )
         );
+
+        assertFalse(nodeIndicesStats.getPartialResultStatus());
     }
 
     private void updateExpectedDocStatusCounter(DocWriteResponse r) {

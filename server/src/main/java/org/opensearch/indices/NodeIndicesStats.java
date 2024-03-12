@@ -60,6 +60,7 @@ import org.opensearch.index.store.StoreStats;
 import org.opensearch.index.translog.TranslogStats;
 import org.opensearch.index.warmer.WarmerStats;
 import org.opensearch.search.suggest.completion.CompletionStats;
+import org.opensearch.transport.TransportStats;
 
 import java.io.IOException;
 import java.util.ArrayList;
@@ -74,10 +75,12 @@ import java.util.Map;
  */
 @PublicApi(since = "1.0.0")
 public class NodeIndicesStats implements Writeable, ToXContentFragment {
+    private boolean partialResultStatus;
     private CommonStats stats;
     private Map<Index, List<IndexShardStats>> statsByShard;
 
     public NodeIndicesStats(StreamInput in) throws IOException {
+        partialResultStatus = in.readBoolean();
         stats = new CommonStats(in);
         if (in.readBoolean()) {
             int entries = in.readVInt();
@@ -94,8 +97,11 @@ public class NodeIndicesStats implements Writeable, ToXContentFragment {
         }
     }
 
-    public NodeIndicesStats(CommonStats oldStats, Map<Index, List<IndexShardStats>> statsByShard, SearchRequestStats searchRequestStats) {
-        // this.stats = stats;
+    public NodeIndicesStats(CommonStats oldStats,
+                            Map<Index, List<IndexShardStats>> statsByShard,
+                            SearchRequestStats searchRequestStats,
+                            Boolean partialResult) {
+        this.partialResultStatus = partialResult;
         this.statsByShard = statsByShard;
 
         // make a total common stats from old ones and current ones
@@ -110,6 +116,11 @@ public class NodeIndicesStats implements Writeable, ToXContentFragment {
         if (this.stats.search != null) {
             this.stats.search.setSearchRequestStats(searchRequestStats);
         }
+    }
+
+    @Nullable
+    public boolean getPartialResultStatus() {
+        return partialResultStatus;
     }
 
     @Nullable
@@ -194,6 +205,7 @@ public class NodeIndicesStats implements Writeable, ToXContentFragment {
 
     @Override
     public void writeTo(StreamOutput out) throws IOException {
+        out.writeBoolean(partialResultStatus);
         stats.writeTo(out);
         out.writeBoolean(statsByShard != null);
         if (statsByShard != null) {
@@ -217,6 +229,9 @@ public class NodeIndicesStats implements Writeable, ToXContentFragment {
         if (!isLevelValid) {
             throw new IllegalArgumentException("level parameter must be one of [indices] or [node] or [shards] but was [" + level + "]");
         }
+
+        builder.startObject();
+        builder.field(Fields.PARTIAL_RESULTS, partialResultStatus);
 
         // "node" level
         builder.startObject(Fields.INDICES);
@@ -247,6 +262,7 @@ public class NodeIndicesStats implements Writeable, ToXContentFragment {
             builder.endObject();
         }
 
+        builder.endObject();
         builder.endObject();
         return builder;
     }
@@ -283,5 +299,7 @@ public class NodeIndicesStats implements Writeable, ToXContentFragment {
      */
     static final class Fields {
         static final String INDICES = "indices";
+
+        static final String PARTIAL_RESULTS = "partial_results";
     }
 }

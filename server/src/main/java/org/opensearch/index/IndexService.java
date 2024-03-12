@@ -117,6 +117,7 @@ import java.util.Set;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.BiFunction;
 import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
@@ -182,6 +183,8 @@ public class IndexService extends AbstractIndexComponent implements IndicesClust
     private final Supplier<TimeValue> clusterDefaultRefreshIntervalSupplier;
     private final Supplier<TimeValue> clusterRemoteTranslogBufferIntervalSupplier;
     private final RecoverySettings recoverySettings;
+
+    private final AtomicInteger inFlightAndCompletedShardRemovals = new AtomicInteger();
 
     public IndexService(
         IndexSettings indexSettings,
@@ -615,6 +618,9 @@ public class IndexService extends AbstractIndexComponent implements IndicesClust
         HashMap<Integer, IndexShard> newShards = new HashMap<>(shards);
         indexShard = newShards.remove(shardId);
         shards = unmodifiableMap(newShards);
+        if (indexShard != null) {
+            inFlightAndCompletedShardRemovals.getAndIncrement();
+        }
         closeShard(reason, sId, indexShard, indexShard.store(), indexShard.getIndexEventListener());
         logger.debug("[{}] closed (reason: [{}])", shardId, reason);
     }
@@ -1295,6 +1301,10 @@ public class IndexService extends AbstractIndexComponent implements IndicesClust
 
     AsyncTrimTranslogTask getTrimTranslogTask() { // for tests
         return trimTranslogTask;
+    }
+
+    public int getShardRemovals() {
+        return inFlightAndCompletedShardRemovals.get();
     }
 
     /**
