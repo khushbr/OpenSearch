@@ -177,6 +177,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -312,6 +313,8 @@ public class IndicesService extends AbstractLifecycleComponent
         Property.NodeScope,
         Property.Final
     );
+
+    private static final ConcurrentLinkedQueue<IndexShard> pendingShardClosure = new ConcurrentLinkedQueue<>();
 
     /**
      * The node's settings.
@@ -615,6 +618,42 @@ public class IndicesService extends AbstractLifecycleComponent
             }
         }
 
+        /* With lack of explicit synchronization b/w {@link OldShardsStats#beforeIndexShardClosed} and stats() API,
+         * the response here is only best effort.
+         *
+         * Depending on the order of execution, we can end up with missing value.
+         * However, double value is avoided by ensuring : 1/ IndexShard is removed from pendingShardClosure queue before
+         * updating oldShardsStats, and 2/ Local copy of oldShardsStats is done before adding pendingShardClosure stats.
+         *
+         */
+        final IndexShard[] pendingShards = pendingShardClosure.toArray(new IndexShard[0]);
+        for(IndexShard shard: pendingShards) {
+            for (Flag flag : flags.getFlags()) {
+                switch (flag) {
+                    case Get:
+                        commonStats.get.add(shard.getStats());
+                        break;
+                    case Indexing:
+                        commonStats.indexing.add(shard.indexingStats());
+                        break;
+                    case Search:
+                        commonStats.search.add(shard.searchStats());
+                        break;
+                    case Merge:
+                        commonStats.merge.add(shard.mergeStats());
+                        break;
+                    case Refresh:
+                        commonStats.refresh.add(shard.refreshStats());
+                        break;
+                    case Recovery:
+                        commonStats.recoveryStats.add(shard.recoveryStats());
+                        break;
+                    case Flush:
+                        commonStats.flush.add(shard.flushStats());
+                        break;
+                }
+            }
+        }
         return new NodeIndicesStats(commonStats, statsByShard(this, flags), searchRequestStats);
     }
 
@@ -1047,6 +1086,11 @@ public class IndicesService extends AbstractLifecycleComponent
 
                 logger.debug("[{}] closing ... (reason [{}])", indexName, reason);
                 Map<String, IndexService> newIndices = new HashMap<>(indices);
+                // For this Index, add all IndexShard refs to pendingShardClosure queue
+                IndexService indService = newIndices.get(index.getUUID());
+                while (indService.iterator().hasNext()) {
+                    pendingShardClosure.add(indService.iterator().next());
+                }
                 indexService = newIndices.remove(index.getUUID());
                 assert indexService != null : "IndexService is null for index: " + index;
                 indices = unmodifiableMap(newIndices);
@@ -1107,14 +1151,17 @@ public class IndicesService extends AbstractLifecycleComponent
         @Override
         public synchronized void beforeIndexShardClosed(ShardId shardId, @Nullable IndexShard indexShard, Settings indexSettings) {
             if (indexShard != null) {
-                getStats.addTotals(indexShard.getStats());
-                indexingStats.addTotals(indexShard.indexingStats());
-                // if this index was closed or deleted, we should eliminate the effect of the current scroll for this shard
-                searchStats.addTotalsForClosingShard(indexShard.searchStats());
-                mergeStats.addTotals(indexShard.mergeStats());
-                refreshStats.addTotals(indexShard.refreshStats());
-                flushStats.addTotals(indexShard.flushStats());
-                recoveryStats.addTotals(indexShard.recoveryStats());
+                // First remove IndexShard from pendingShardClosure queue before updating OldShardsStats
+                final boolean removedShard = pendingShardClosure.remove(indexShard);
+                if (removedShard)
+                    getStats.addTotals(indexShard.getStats());
+                    indexingStats.addTotals(indexShard.indexingStats());
+                    // if this index was closed or deleted, we should eliminate the effect of the current scroll for this shard
+                    searchStats.addTotalsForClosingShard(indexShard.searchStats());
+                    mergeStats.addTotals(indexShard.mergeStats());
+                    refreshStats.addTotals(indexShard.refreshStats());
+                    flushStats.addTotals(indexShard.flushStats());
+                    recoveryStats.addTotals(indexShard.recoveryStats());
             }
         }
     }
