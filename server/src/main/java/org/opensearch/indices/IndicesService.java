@@ -377,6 +377,7 @@ public class IndicesService extends AbstractLifecycleComponent
 
     private final SearchRequestStats searchRequestStats;
 
+    private AtomicInteger pendingIndexShardRemoval;
     @Override
     protected void doStart() {
         // Start thread that will manage cleaning the field data cache periodically
@@ -512,6 +513,7 @@ public class IndicesService extends AbstractLifecycleComponent
         clusterService.getClusterSettings()
             .addSettingsUpdateConsumer(CLUSTER_REMOTE_TRANSLOG_BUFFER_INTERVAL_SETTING, this::setClusterRemoteTranslogBufferInterval);
         this.recoverySettings = recoverySettings;
+        this.pendingIndexShardRemoval = new AtomicInteger();
     }
 
     /**
@@ -602,7 +604,16 @@ public class IndicesService extends AbstractLifecycleComponent
 
     public NodeIndicesStats stats(CommonStatsFlags flags) {
         CommonStats commonStats = new CommonStats(flags);
-        // the cumulative statistics also account for shards that are no longer on this node, which is tracked by oldShardsStats
+        /**
+         * The cumulative statistics also account for shards that are no longer on this node, which is tracked by oldShardsStats.
+         *
+         * While computing stats() value, a race condition b/w adding a pending-closure shard's stats to oldShardsStats in
+         * {@link OldShardsStats#beforeIndexShardClosed} and per Shard Stat calculation in {@link IndicesService#statsByShard}
+         * can result in missing stat value. Detect the race-condition (best-effort) and report as {@link InconsistentStatsException}
+         */
+        if (!oldShardsStats.shardsClosed.equals(pendingIndexShardRemoval.get()))
+            throw new InconsistentStatsException(NodeIndicesStats.class.getName(), "Stats not updated for closed shards");
+
         for (Flag flag : flags.getFlags()) {
             switch (flag) {
                 case Get:
@@ -1061,8 +1072,11 @@ public class IndicesService extends AbstractLifecycleComponent
 
                 logger.debug("[{}] closing ... (reason [{}])", indexName, reason);
                 Map<String, IndexService> newIndices = new HashMap<>(indices);
-                indexService = newIndices.remove(index.getUUID());
+                indexService = newIndices.get(index.getUUID());
                 assert indexService != null : "IndexService is null for index: " + index;
+                final int indexShardCount = indexService.shardIds().size();
+                pendingIndexShardRemoval.getAndAdd(indexShardCount);
+                newIndices.remove(index.getUUID());
                 indices = unmodifiableMap(newIndices);
                 listener = indexService.getIndexEventListener();
             }
@@ -1110,6 +1124,7 @@ public class IndicesService extends AbstractLifecycleComponent
      */
     static class OldShardsStats implements IndexEventListener {
 
+        Integer shardsClosed = 0;
         final SearchStats searchStats = new SearchStats();
         final GetStats getStats = new GetStats();
         final IndexingStats indexingStats = new IndexingStats();
@@ -1121,6 +1136,7 @@ public class IndicesService extends AbstractLifecycleComponent
         @Override
         public synchronized void beforeIndexShardClosed(ShardId shardId, @Nullable IndexShard indexShard, Settings indexSettings) {
             if (indexShard != null) {
+                shardsClosed++;
                 getStats.addTotals(indexShard.getStats());
                 indexingStats.addTotals(indexShard.indexingStats());
                 // if this index was closed or deleted, we should eliminate the effect of the current scroll for this shard

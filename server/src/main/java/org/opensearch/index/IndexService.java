@@ -117,6 +117,7 @@ import java.util.Set;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.BiFunction;
 import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
@@ -182,6 +183,8 @@ public class IndexService extends AbstractIndexComponent implements IndicesClust
     private final Supplier<TimeValue> clusterDefaultRefreshIntervalSupplier;
     private final Supplier<TimeValue> clusterRemoteTranslogBufferIntervalSupplier;
     private final RecoverySettings recoverySettings;
+
+    private AtomicInteger pendingShardsRemoval;
 
     public IndexService(
         IndexSettings indexSettings,
@@ -295,6 +298,7 @@ public class IndexService extends AbstractIndexComponent implements IndicesClust
         this.translogFactorySupplier = translogFactorySupplier;
         this.clusterRemoteTranslogBufferIntervalSupplier = clusterRemoteTranslogBufferIntervalSupplier;
         this.recoverySettings = recoverySettings;
+        this.pendingShardsRemoval = new AtomicInteger();
         updateFsyncTaskIfNecessary();
     }
 
@@ -386,7 +390,7 @@ public class IndexService extends AbstractIndexComponent implements IndicesClust
                 final Set<Integer> shardIds = shardIds();
                 for (final int shardId : shardIds) {
                     try {
-                        removeShard(shardId, reason);
+                        removeShard(shardId, reason, false);
                     } catch (Exception e) {
                         logger.warn("failed to close shard", e);
                     }
@@ -605,7 +609,7 @@ public class IndexService extends AbstractIndexComponent implements IndicesClust
     }
 
     @Override
-    public synchronized void removeShard(int shardId, String reason) {
+    public synchronized void removeShard(int shardId, String reason, boolean incPendingShardClosedCounter) {
         final ShardId sId = new ShardId(index(), shardId);
         final IndexShard indexShard;
         if (shards.containsKey(shardId) == false) {
@@ -613,6 +617,9 @@ public class IndexService extends AbstractIndexComponent implements IndicesClust
         }
         logger.debug("[{}] closing... (reason: [{}])", shardId, reason);
         HashMap<Integer, IndexShard> newShards = new HashMap<>(shards);
+        if (incPendingShardClosedCounter) {
+            pendingShardsRemoval.getAndIncrement();
+        }
         indexShard = newShards.remove(shardId);
         shards = unmodifiableMap(newShards);
         closeShard(reason, sId, indexShard, indexShard.store(), indexShard.getIndexEventListener());
