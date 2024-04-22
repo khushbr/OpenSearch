@@ -66,6 +66,7 @@ import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
 import org.opensearch.cluster.metadata.MappingMetadata;
 import org.opensearch.cluster.metadata.Metadata;
 import org.opensearch.cluster.service.ClusterService;
+import org.opensearch.common.UUIDs;
 import org.opensearch.common.inject.Inject;
 import org.opensearch.common.lease.Releasable;
 import org.opensearch.common.unit.TimeValue;
@@ -84,7 +85,9 @@ import org.opensearch.indices.IndicesService;
 import org.opensearch.indices.SystemIndices;
 import org.opensearch.ingest.IngestService;
 import org.opensearch.node.NodeClosedException;
+import org.opensearch.search.sort.SortBuilder;
 import org.opensearch.tasks.Task;
+import org.opensearch.telemetry.metrics.tags.Tags;
 import org.opensearch.telemetry.tracing.Span;
 import org.opensearch.telemetry.tracing.SpanBuilder;
 import org.opensearch.telemetry.tracing.SpanScope;
@@ -94,23 +97,18 @@ import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.threadpool.ThreadPool.Names;
 import org.opensearch.transport.TransportService;
 
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.Iterator;
-import java.util.List;
-import java.util.Locale;
-import java.util.Map;
-import java.util.Objects;
-import java.util.Set;
-import java.util.SortedMap;
+import java.util.*;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicIntegerArray;
 import java.util.function.LongSupplier;
 import java.util.stream.Collectors;
+import java.util.stream.IntStream;
+import java.util.stream.Stream;
 
 import static java.util.Collections.emptyMap;
+import static org.opensearch.action.DocWriteRequest.OpType.INDEX;
 import static org.opensearch.cluster.metadata.IndexNameExpressionResolver.EXCLUDED_DATA_STREAMS_KEY;
 import static org.opensearch.index.seqno.SequenceNumbers.UNASSIGNED_PRIMARY_TERM;
 import static org.opensearch.index.seqno.SequenceNumbers.UNASSIGNED_SEQ_NO;
@@ -409,7 +407,7 @@ public class TransportBulkAction extends HandledTransportAction<BulkRequest, Bul
                     + "] instead"
             );
         }
-        if (opType == DocWriteRequest.OpType.INDEX
+        if (opType == INDEX
             && writeRequest.ifPrimaryTerm() == UNASSIGNED_PRIMARY_TERM
             && writeRequest.ifSeqNo() == UNASSIGNED_SEQ_NO) {
             throw new IllegalArgumentException(
@@ -533,6 +531,20 @@ public class TransportBulkAction extends HandledTransportAction<BulkRequest, Bul
             final ConcreteIndices concreteIndices = new ConcreteIndices(clusterState, indexNameExpressionResolver);
             Metadata metadata = clusterState.metadata();
             final long startTimeMs = System.currentTimeMillis();
+
+            // Get all target concrete indices in the bulk request. Randomly select a target shard within Index for routing.
+            final List<Index> targetConcreteIndices = bulkRequest.requests.stream()
+                .map(request -> concreteIndices.getConcreteIndex(request.index()))
+                .distinct()
+                .collect(Collectors.toList());
+            final HashMap<String, Integer> targetRoutingShards = targetConcreteIndices.stream()
+                .collect(Collectors.toMap(
+                    Index::getName,
+                    concreteIndex -> ThreadLocalRandom.current().nextInt(0, metadata.index(concreteIndex).getRoutingNumShards() + 1),
+                    (n1, n2) -> n1,
+                    HashMap::new)
+                );
+
             for (int i = 0; i < bulkRequest.requests.size(); i++) {
                 DocWriteRequest<?> docWriteRequest = bulkRequest.requests.get(i);
                 // the request can only be null because we set it to null in the previous step, so it gets ignored
@@ -566,10 +578,27 @@ public class TransportBulkAction extends HandledTransportAction<BulkRequest, Bul
                             prohibitCustomRoutingOnDataStream(docWriteRequest, metadata);
                             IndexRequest indexRequest = (IndexRequest) docWriteRequest;
                             final IndexMetadata indexMetadata = metadata.index(concreteIndex);
-                            MappingMetadata mappingMd = indexMetadata.mapping();
-                            Version indexCreated = indexMetadata.getCreationVersion();
-                            indexRequest.resolveRouting(metadata);
-                            indexRequest.process(indexCreated, mappingMd, concreteIndex.getName());
+
+                            // TODO: [Optimization] Pre-Generate and cache (n x m) doc IDs in HashMap, with n = # docRequests, m = # routingShards.
+                            final ShardId targetShardId = clusterState.getRoutingTable()
+                                .shardRoutingTable(concreteIndex.getName(), targetRoutingShards.get(concreteIndex.getName())).shardsIt().shardId();
+                            int docIdCount = metadata.index(concreteIndex.getName()).getRoutingNumShards();
+                            final ArrayList<String> potentialDocIDs = new ArrayList<>();
+                            IntStream.range(0, docIdCount).forEach(id -> potentialDocIDs.add(UUIDs.base64UUID()));
+                            for (String candidateDocId: potentialDocIDs) {
+                                ShardId candidateShardId = clusterService.operationRouting()
+                                    .indexShards(clusterState, indexRequest.index(), candidateDocId, indexRequest.routing())
+                                    .shardId();
+                                if (targetShardId.equals(candidateShardId)) {
+                                    MappingMetadata mappingMd = indexMetadata.mapping();
+                                    indexRequest.resolveRouting(metadata);
+                                    indexRequest.process(mappingMd, concreteIndex.getName(), candidateDocId);
+                                    break;
+                                }
+                            }
+                            if (indexRequest.id() == null) {
+                                throw new AssertionError("Couldn't find a matching Doc ID for Shard: " + targetShardId);
+                            }
                             break;
                         case UPDATE:
                             TransportUpdateAction.resolveAndValidateRouting(
