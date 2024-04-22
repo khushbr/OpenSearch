@@ -532,6 +532,7 @@ public class TransportBulkAction extends HandledTransportAction<BulkRequest, Bul
             }
             final ConcreteIndices concreteIndices = new ConcreteIndices(clusterState, indexNameExpressionResolver);
             Metadata metadata = clusterState.metadata();
+            final long startTimeMs = System.currentTimeMillis();
             for (int i = 0; i < bulkRequest.requests.size(); i++) {
                 DocWriteRequest<?> docWriteRequest = bulkRequest.requests.get(i);
                 // the request can only be null because we set it to null in the previous step, so it gets ignored
@@ -595,6 +596,7 @@ public class TransportBulkAction extends HandledTransportAction<BulkRequest, Bul
                     bulkRequest.requests.set(i, null);
                 }
             }
+            logger.info("Processed BulkRequest: {}, Time taken: {}, ", bulkRequest.requests.size(), (System.currentTimeMillis() - startTimeMs));
 
             // first, go over all the requests and create a ShardId -> Operations mapping
             Map<ShardId, List<BulkItemRequest>> requestsByShard = new HashMap<>();

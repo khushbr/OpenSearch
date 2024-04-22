@@ -32,6 +32,7 @@
 
 package org.opensearch.cluster.routing;
 
+import org.apache.logging.log4j.Logger;
 import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.WeightedRoutingMetadata;
@@ -39,6 +40,7 @@ import org.opensearch.cluster.node.DiscoveryNodes;
 import org.opensearch.cluster.routing.allocation.decider.AwarenessAllocationDecider;
 import org.opensearch.common.Nullable;
 import org.opensearch.common.annotation.PublicApi;
+import org.opensearch.common.logging.Loggers;
 import org.opensearch.common.settings.ClusterSettings;
 import org.opensearch.common.settings.Setting;
 import org.opensearch.common.settings.Settings;
@@ -113,6 +115,7 @@ public class OperationRouting {
         Preference.PREFER_NODES
     );
 
+    private static final Logger logger = Loggers.getLogger(OperationRouting.class, "MOMO");
     private volatile List<String> awarenessAttributes;
     private volatile boolean useAdaptiveReplicaSelection;
     private volatile boolean ignoreAwarenessAttr;
@@ -450,6 +453,7 @@ public class OperationRouting {
     }
 
     public static int generateShardId(IndexMetadata indexMetadata, @Nullable String id, @Nullable String routing) {
+        final long startTimeMs = System.currentTimeMillis();
         final String effectiveRouting;
         final int partitionOffset;
 
@@ -466,8 +470,9 @@ public class OperationRouting {
             // we would have still got 0 above but this check just saves us an unnecessary hash calculation
             partitionOffset = 0;
         }
-
-        return calculateScaledShardId(indexMetadata, effectiveRouting, partitionOffset);
+        final int shardId = calculateScaledShardId(indexMetadata, effectiveRouting, partitionOffset);
+        logger.info("Routing Shard ID: {}, Time taken: {}, ", shardId, (System.currentTimeMillis() - startTimeMs));
+        return shardId;
     }
 
     private static int calculateScaledShardId(IndexMetadata indexMetadata, String effectiveRouting, int partitionOffset) {
