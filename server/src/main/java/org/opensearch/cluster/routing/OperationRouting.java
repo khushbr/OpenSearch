@@ -453,7 +453,7 @@ public class OperationRouting {
     }
 
     public static int generateShardId(IndexMetadata indexMetadata, @Nullable String id, @Nullable String routing) {
-        final long startTimeMs = System.currentTimeMillis();
+        final long startTimeNanos = System.nanoTime();
         final String effectiveRouting;
         final int partitionOffset;
 
@@ -471,7 +471,7 @@ public class OperationRouting {
             partitionOffset = 0;
         }
         final int shardId = calculateScaledShardId(indexMetadata, effectiveRouting, partitionOffset);
-        logger.info("Routing Shard ID: {}, Time taken: {}, ", shardId, (System.currentTimeMillis() - startTimeMs));
+        logger.info("Inside generateShardId(), routing shard ID: {} and time taken: {} ", shardId, (System.nanoTime() - startTimeNanos));
         return shardId;
     }
 

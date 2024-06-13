@@ -913,6 +913,29 @@ public class IndexMetadata implements Diffable<IndexMetadata>, ToXContentFragmen
     public DiscoveryNodeFilters excludeFilters() {
         return excludeFilters;
     }
+    @Override
+    public String toString() {
+        return "IndexMetadata{" +
+            "routingNumShards=" + routingNumShards +
+            ", routingFactor=" + routingFactor +
+            ", routingPartitionSize=" + routingPartitionSize +
+            ", numberOfShards=" + numberOfShards +
+            ", numberOfReplicas=" + numberOfReplicas +
+            ", index=" + index +
+            ", version=" + version +
+            ", mappingVersion=" + mappingVersion +
+            ", settingsVersion=" + settingsVersion +
+            ", aliasesVersion=" + aliasesVersion +
+            ", state=" + state +
+            ", totalNumberOfShards=" + totalNumberOfShards +
+            ", initialRecoveryFilters=" + initialRecoveryFilters +
+            ", indexCreatedVersion=" + indexCreatedVersion +
+            ", indexUpgradedVersion=" + indexUpgradedVersion +
+            ", waitForActiveShards=" + waitForActiveShards +
+            ", rolloverInfos=" + rolloverInfos +
+            ", isSystem=" + isSystem +
+            '}';
+    }
 
     @Override
     public boolean equals(Object o) {

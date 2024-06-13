@@ -65,6 +65,7 @@ import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
 import org.opensearch.cluster.metadata.MappingMetadata;
 import org.opensearch.cluster.metadata.Metadata;
+import org.opensearch.cluster.routing.OperationRouting;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.UUIDs;
 import org.opensearch.common.inject.Inject;
@@ -137,6 +138,7 @@ public class TransportBulkAction extends HandledTransportAction<BulkRequest, Bul
     private final IndicesService indicesService;
     private final SystemIndices systemIndices;
     private final Tracer tracer;
+    private final DocIDCache cache;
 
     @Inject
     public TransportBulkAction(
@@ -204,6 +206,9 @@ public class TransportBulkAction extends HandledTransportAction<BulkRequest, Bul
         this.systemIndices = systemIndices;
         clusterService.addStateApplier(this.ingestForwarder);
         this.tracer = tracer;
+        this.cache = new DocIDCache(100, 5000);
+        /*this.cancellableDocIDRefillTask = threadPool.scheduleWithFixedDelay(() ->
+            this.cache.refill(this.clusterService), docIdRefillInterval, ThreadPool.Names.GENERIC);*/
     }
 
     /**
@@ -524,28 +529,21 @@ public class TransportBulkAction extends HandledTransportAction<BulkRequest, Bul
         @Override
         protected void doRun() {
             assert bulkRequest != null;
+            final long startTimeNanosBulkOp = System.nanoTime();
             final ClusterState clusterState = observer.setAndGetObservedState();
             if (handleBlockExceptions(clusterState)) {
                 return;
             }
             final ConcreteIndices concreteIndices = new ConcreteIndices(clusterState, indexNameExpressionResolver);
             Metadata metadata = clusterState.metadata();
-            final long startTimeMs = System.currentTimeMillis();
+            final int bulkSize = bulkRequest.requests.size();
+            logger.info("Total Bulk Request size: {}. Invoking refill on the cache.", bulkSize);
+            //CompletableFuture.runAsync(() -> cache.refill(clusterService), threadPool.executor(Names.GENERIC));
+            cache.refill(clusterService);
 
-            // Get all target concrete indices in the bulk request. Randomly select a target shard within Index for routing.
-            final List<Index> targetConcreteIndices = bulkRequest.requests.stream()
-                .map(request -> concreteIndices.getConcreteIndex(request.index()))
-                .distinct()
-                .collect(Collectors.toList());
-            final HashMap<String, Integer> targetRoutingShards = targetConcreteIndices.stream()
-                .collect(Collectors.toMap(
-                    Index::getName,
-                    concreteIndex -> ThreadLocalRandom.current().nextInt(0, metadata.index(concreteIndex).getRoutingNumShards() + 1),
-                    (n1, n2) -> n1,
-                    HashMap::new)
-                );
-
-            for (int i = 0; i < bulkRequest.requests.size(); i++) {
+            Map<String, ShardId> targetRoutingShards = new HashMap<>();
+            Map<ShardId, List<BulkItemRequest>> requestsByShard = new HashMap<>();
+            for (int i = 0; i < bulkSize; i++) {
                 DocWriteRequest<?> docWriteRequest = bulkRequest.requests.get(i);
                 // the request can only be null because we set it to null in the previous step, so it gets ignored
                 if (docWriteRequest == null) {
@@ -558,19 +556,27 @@ public class TransportBulkAction extends HandledTransportAction<BulkRequest, Bul
                     continue;
                 }
                 Index concreteIndex = concreteIndices.resolveIfAbsent(docWriteRequest);
+                boolean isSystemIndex = concreteIndex.getName().startsWith(".");
+                logger.info("Routing bulk request for concreteIndex: {}, isSystemIndex: {}", concreteIndex, isSystemIndex);
+                targetRoutingShards.computeIfAbsent(concreteIndex.getName(), index -> {
+                    int id = ThreadLocalRandom.current().nextInt(0, metadata.index(index).getNumberOfShards());
+                    return clusterState.getRoutingTable().shardRoutingTable(index, id).shardsIt().shardId();
+                });
+
                 try {
                     // The ConcreteIndices#resolveIfAbsent(...) method validates via IndexNameExpressionResolver whether
                     // an operation is allowed in index into a data stream, but this isn't done when resolve call is cached, so
                     // the validation needs to be performed here too.
                     IndexAbstraction indexAbstraction = clusterState.getMetadata().getIndicesLookup().get(concreteIndex.getName());
                     if (indexAbstraction.getParentDataStream() != null &&
-                    // avoid valid cases when directly indexing into a backing index
-                    // (for example when directly indexing into .ds-logs-foobar-000001)
-                        concreteIndex.getName().equals(docWriteRequest.index()) == false
+                        // avoid valid cases when directly indexing into a backing index
+                        // (for example when directly indexing into .ds-logs-foobar-000001)
+                        !concreteIndex.getName().equals(docWriteRequest.index())
                         && docWriteRequest.opType() != DocWriteRequest.OpType.CREATE) {
                         throw new IllegalArgumentException("only write ops with an op_type of create are allowed in data streams");
                     }
 
+                    ShardId targetShardId = null;
                     switch (docWriteRequest.opType()) {
                         case CREATE:
                         case INDEX:
@@ -578,24 +584,42 @@ public class TransportBulkAction extends HandledTransportAction<BulkRequest, Bul
                             prohibitCustomRoutingOnDataStream(docWriteRequest, metadata);
                             IndexRequest indexRequest = (IndexRequest) docWriteRequest;
                             final IndexMetadata indexMetadata = metadata.index(concreteIndex);
-
-                            // TODO: [Optimization] Pre-Generate and cache (n x m) doc IDs in HashMap, with n = # docRequests, m = # routingShards.
-                            final ShardId targetShardId = clusterState.getRoutingTable()
-                                .shardRoutingTable(concreteIndex.getName(), targetRoutingShards.get(concreteIndex.getName())).shardsIt().shardId();
-                            int docIdCount = metadata.index(concreteIndex.getName()).getRoutingNumShards();
-                            final ArrayList<String> potentialDocIDs = new ArrayList<>();
-                            IntStream.range(0, docIdCount).forEach(id -> potentialDocIDs.add(UUIDs.base64UUID()));
-                            for (String candidateDocId: potentialDocIDs) {
-                                ShardId candidateShardId = clusterService.operationRouting()
-                                    .indexShards(clusterState, indexRequest.index(), candidateDocId, indexRequest.routing())
-                                    .shardId();
-                                if (targetShardId.equals(candidateShardId)) {
-                                    MappingMetadata mappingMd = indexMetadata.mapping();
-                                    indexRequest.resolveRouting(metadata);
-                                    indexRequest.process(mappingMd, concreteIndex.getName(), candidateDocId);
-                                    break;
-                                }
+                            MappingMetadata mappingMd = indexMetadata.mapping();
+                            indexRequest.resolveRouting(metadata);
+                            if (isSystemIndex) {
+                                Version indexCreated = indexMetadata.getCreationVersion();
+                                indexRequest.process(indexCreated, mappingMd, concreteIndex.getName());
+                                logger.info("Retaining older doc ID assignment for system index: {}. Returning.", concreteIndex.getName());
+                                break;
                             }
+
+                            targetShardId = targetRoutingShards.get(concreteIndex.getName());
+                            logger.info("Running next for concreteIndex: {} and shard: {}", concreteIndex.getName(), targetShardId);
+                            if (targetShardId != null) {
+                                final long startTimeNanosDocIDGetOp = System.nanoTime();
+                                DocIDCache.DocIDCacheKey targetKey = new DocIDCache.DocIDCacheKey(concreteIndex.getName(), targetShardId.getId());
+                                final String docId = cache.consumeDocId(targetKey);
+                                if (docId != null) {
+                                    indexRequest.process(mappingMd, concreteIndex.getName(), docId);
+                                    logger.info("Pre-generated Doc ID: {}, Time taken: {},", docId, System.nanoTime() - startTimeNanosDocIDGetOp);
+                                } else {
+                                    // In case of doc Ids unavailable in cache store, fall back to brute force doc ID generation.
+                                    int shardIdCount = metadata.index(concreteIndex.getName()).getRoutingNumShards();
+                                    final List<String> potentialDocIDs = IntStream.range(0, shardIdCount).mapToObj(id -> UUIDs.base64UUID()).collect(Collectors.toList());
+                                    for (String candidateDocId : potentialDocIDs) {
+                                        int candidateShardId = OperationRouting.generateShardId(indexMetadata, candidateDocId, null);
+                                        if (targetShardId.getId() == candidateShardId) {
+                                            indexRequest.process(mappingMd, concreteIndex.getName(), candidateDocId);
+                                            logger.info("Brute-force generated Doc ID: {} for shard: {}, Time taken: {},",
+                                                candidateDocId, targetShardId, System.nanoTime() - startTimeNanosDocIDGetOp);
+                                            break;
+                                        }
+                                    }
+                                }
+                            } else {
+                                throw new AssertionError("Routing Shard ID cannot be null");
+                            }
+
                             if (indexRequest.id() == null) {
                                 throw new AssertionError("Couldn't find a matching Doc ID for Shard: " + targetShardId);
                             }
@@ -617,6 +641,14 @@ public class TransportBulkAction extends HandledTransportAction<BulkRequest, Bul
                         default:
                             throw new AssertionError("request type not supported: [" + docWriteRequest.opType() + "]");
                     }
+
+                    if (targetShardId == null) {
+                        targetShardId = clusterService.operationRouting()
+                            .indexShards(clusterState, concreteIndex.getName(), docWriteRequest.id(), docWriteRequest.routing())
+                            .shardId();
+                    }
+                    List<BulkItemRequest> shardRequests = requestsByShard.computeIfAbsent(targetShardId, shard -> new ArrayList<>());
+                    shardRequests.add(new BulkItemRequest(i, docWriteRequest));
                 } catch (OpenSearchParseException | IllegalArgumentException | RoutingMissingException e) {
                     BulkItemResponse.Failure failure = new BulkItemResponse.Failure(concreteIndex.getName(), docWriteRequest.id(), e);
                     BulkItemResponse bulkItemResponse = new BulkItemResponse(i, docWriteRequest.opType(), failure);
@@ -624,22 +656,6 @@ public class TransportBulkAction extends HandledTransportAction<BulkRequest, Bul
                     // make sure the request gets never processed again
                     bulkRequest.requests.set(i, null);
                 }
-            }
-            logger.info("Processed BulkRequest: {}, Time taken: {}, ", bulkRequest.requests.size(), (System.currentTimeMillis() - startTimeMs));
-
-            // first, go over all the requests and create a ShardId -> Operations mapping
-            Map<ShardId, List<BulkItemRequest>> requestsByShard = new HashMap<>();
-            for (int i = 0; i < bulkRequest.requests.size(); i++) {
-                DocWriteRequest<?> request = bulkRequest.requests.get(i);
-                if (request == null) {
-                    continue;
-                }
-                String concreteIndex = concreteIndices.getConcreteIndex(request.index()).getName();
-                ShardId shardId = clusterService.operationRouting()
-                    .indexShards(clusterState, concreteIndex, request.id(), request.routing())
-                    .shardId();
-                List<BulkItemRequest> shardRequests = requestsByShard.computeIfAbsent(shardId, shard -> new ArrayList<>());
-                shardRequests.add(new BulkItemRequest(i, request));
             }
 
             if (requestsByShard.isEmpty()) {
@@ -658,6 +674,7 @@ public class TransportBulkAction extends HandledTransportAction<BulkRequest, Bul
                 return;
             }
 
+            logger.info("Processed BulkRequest: {}, Time taken: {}. requestsByShard size: {}", bulkRequest.requests.size(), (System.nanoTime() - startTimeNanosBulkOp), requestsByShard.size());
             final AtomicInteger counter = new AtomicInteger(requestsByShard.size());
             final DocStatusStats docStatusStats = new DocStatusStats();
             String nodeId = clusterService.localNode().getId();
@@ -683,7 +700,6 @@ public class TransportBulkAction extends HandledTransportAction<BulkRequest, Bul
                     bulkShardRequest::ramBytesUsed,
                     isOnlySystem
                 );
-
                 final Span span = tracer.startSpan(SpanBuilder.from("bulkShardAction", nodeId, bulkShardRequest));
                 try (SpanScope spanScope = tracer.withSpanInScope(span)) {
                     shardBulkAction.execute(
@@ -745,7 +761,7 @@ public class TransportBulkAction extends HandledTransportAction<BulkRequest, Bul
                 }
             }
             bulkRequest = null; // allow memory for bulk request items to be reclaimed before all items have been completed
-        }
+	}
 
         private boolean handleBlockExceptions(ClusterState state) {
             ClusterBlockException blockException = state.blocks().globalBlockedException(ClusterBlockLevel.WRITE);
